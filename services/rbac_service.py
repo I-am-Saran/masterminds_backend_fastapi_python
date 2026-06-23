@@ -7,10 +7,12 @@ from typing import Optional, List, Dict, Any, Tuple, Set, Callable
 from datetime import datetime, timezone
 from functools import wraps
 import inspect
+import time
 from fastapi import HTTPException
 # COMMENTED OUT FOR LOCAL DEVELOPMENT - Using local PostgreSQL instead
 # from services.supabase_client import supabase
 from services.db_service import local_db as supabase  # Use local DB service
+from services.request_context import get_request_context, add_timing_ms
 import uuid
 
 # Global registry to dynamically track all modules and actions
@@ -39,9 +41,9 @@ def require_permission(permission_code: str):
                 raise HTTPException(status_code=401, detail="Missing Authorization header")
 
             # Get user ID and tenant_id from token
-            from services.auth_service import get_user_from_token
-            token = authorization.split(" ", 1)[1].strip() if authorization else None
-            user = get_user_from_token(token) if token else None
+            from services.auth_service import auth_guard
+            auth_ctx = auth_guard(authorization)
+            user = auth_ctx.get("user")
 
             if not user:
                 raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -88,6 +90,14 @@ def require_permission(permission_code: str):
 
 def get_user_roles(user_id: str, tenant_id: str) -> List[Dict[str, Any]]:
     """Get all roles assigned to a user."""
+    ctx = get_request_context()
+    cache = (ctx or {}).get("cache")
+    cache_key = f"{user_id}:{tenant_id}"
+    if isinstance(cache, dict):
+        user_roles_cache = cache.get("user_roles")
+        if isinstance(user_roles_cache, dict) and cache_key in user_roles_cache:
+            return user_roles_cache[cache_key]
+
     try:
         print(f"[get_user_roles] Fetching roles for user_id={user_id}, tenant_id={tenant_id}")
         resp = supabase.table("user_roles").select(
@@ -137,6 +147,8 @@ def get_user_roles(user_id: str, tenant_id: str) -> List[Dict[str, Any]]:
                 enriched_roles.append(user_role)
         
         print(f"[get_user_roles] Returning {len(enriched_roles)} enriched role(s)")
+        if isinstance(cache, dict):
+            cache.setdefault("user_roles", {})[cache_key] = enriched_roles
         return enriched_roles
     except Exception as e:
         print(f"Error getting user roles: {e}")
@@ -252,9 +264,16 @@ def is_global_superadmin(user_id: str) -> bool:
     1) Designated email superadmin@cavininfotech.com is always super admin.
     2) Otherwise checks all roles across all tenants for super admin role name.
     """
+    ctx = get_request_context()
+    cache = (ctx or {}).get("cache")
+    if isinstance(cache, dict) and cache.get("is_global_superadmin") is not None:
+        return bool(cache.get("is_global_superadmin"))
+
     try:
         if _is_superadmin_by_email(user_id):
             print(f"[is_global_superadmin] User {user_id} is Super Admin by email ({SUPERADMIN_EMAIL})")
+            if isinstance(cache, dict):
+                cache["is_global_superadmin"] = True
             return True
         
         super_admin_variants = ["super admin", "superadmin", "super_admin", "global super admin"]
@@ -274,15 +293,24 @@ def is_global_superadmin(user_id: str) -> bool:
                 role_name = role_resp.data[0].get("role_name", "")
                 if role_name and str(role_name).lower() in super_admin_variants:
                     print(f"[is_global_superadmin] User {user_id} is Global Super Admin ({role_name})")
+                    if isinstance(cache, dict):
+                        cache["is_global_superadmin"] = True
                     return True
                     
+        if isinstance(cache, dict):
+            cache["is_global_superadmin"] = False
         return False
     except Exception as e:
         print(f"Error checking global superadmin status: {e}")
         return False
 
 
-def is_superadmin(user_id: str, tenant_id: str) -> bool:
+def is_superadmin(
+    user_id: str,
+    tenant_id: str,
+    global_superadmin: Optional[bool] = None,
+    user_roles: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
     """
     Check if user has Super Admin role.
     Super Admin users have full access including viewing soft-deleted items.
@@ -290,14 +318,16 @@ def is_superadmin(user_id: str, tenant_id: str) -> bool:
     """
     try:
         # 1. Global Super Admin Check (Absolute Priority)
-        if is_global_superadmin(user_id):
+        if global_superadmin is None:
+            global_superadmin = is_global_superadmin(user_id)
+        if global_superadmin:
             return True
             
         super_admin_variants = ["super admin", "superadmin", "super_admin", "global super admin"]
         
         # 2. Check specific tenant roles (Legacy fallback)
-        user_roles = get_user_roles(user_id, tenant_id)
-        for user_role in user_roles:
+        roles = user_roles if user_roles is not None else get_user_roles(user_id, tenant_id)
+        for user_role in roles:
             role = user_role.get("roles", {})
             if isinstance(role, dict):
                 role_name = role.get("role_name", "")
@@ -313,6 +343,13 @@ def is_superadmin(user_id: str, tenant_id: str) -> bool:
 
 def get_role_permissions(role_id: str, tenant_id: str) -> List[Dict[str, Any]]:
     """Get all permissions for a role."""
+    ctx = get_request_context()
+    cache = (ctx or {}).get("cache")
+    if isinstance(cache, dict):
+        rp_cache = cache.get("role_permissions")
+        if isinstance(rp_cache, dict) and role_id in rp_cache:
+            return rp_cache[role_id]
+
     try:
         print(f"[get_role_permissions] Fetching permissions for role_id={role_id}. Ignoring tenant_id filter to prevent mismatches.")
         resp = supabase.table("permissions").select("*").eq(
@@ -322,6 +359,8 @@ def get_role_permissions(role_id: str, tenant_id: str) -> List[Dict[str, Any]]:
         print(f"[get_role_permissions] Found {len(permissions)} permissions")
         if permissions:
             print(f"[get_role_permissions] Sample permission: {permissions[0]}")
+        if isinstance(cache, dict):
+            cache.setdefault("role_permissions", {})[role_id] = permissions
         return permissions
     except Exception as e:
         print(f"Error getting role permissions: {e}")
@@ -345,21 +384,35 @@ def check_permission(
     2. Queries permissions table to get role permissions
     3. Checks if the specific module+action permission exists
     """
+    t0 = time.perf_counter()
+    ctx = get_request_context()
+    cache = (ctx or {}).get("cache")
+    perm_key = f"{user_id}:{tenant_id}:{module_name.lower()}:{action.lower()}"
+    if isinstance(cache, dict):
+        pc = cache.get("permission_checks")
+        if isinstance(pc, dict) and perm_key in pc:
+            return bool(pc[perm_key])
+
     try:
-        # 1. Global Super Admin Check - NO tenant dependency
-        if is_global_superadmin(user_id):
+        global_sa = is_global_superadmin(user_id)
+        if global_sa:
             print(f"[check_permission] User {user_id} is Global Super Admin - bypassing checks")
+            if isinstance(cache, dict):
+                cache.setdefault("permission_checks", {})[perm_key] = True
             return True
 
-        # Check if user is superadmin first - superadmins have all permissions
-        if is_superadmin(user_id, tenant_id):
-            print(f"[check_permission] User {user_id} is superadmin - granting permission: {module_name}.{action}")
-            return True
-        
-        # Get user's roles from database
         user_roles = get_user_roles(user_id, tenant_id)
+
+        if is_superadmin(user_id, tenant_id, global_superadmin=global_sa, user_roles=user_roles):
+            print(f"[check_permission] User {user_id} is superadmin - granting permission: {module_name}.{action}")
+            if isinstance(cache, dict):
+                cache.setdefault("permission_checks", {})[perm_key] = True
+            return True
+
         if not user_roles:
             print(f"[check_permission] No roles found for user_id={user_id}, tenant_id={tenant_id}")
+            if isinstance(cache, dict):
+                cache.setdefault("permission_checks", {})[perm_key] = False
             return False
 
         print(f"[check_permission] Found {len(user_roles)} role(s) for user_id={user_id}, tenant_id={tenant_id}")
@@ -410,17 +463,23 @@ def check_permission(
                         # Check if permission is explicitly True (handle both boolean and string "true")
                         if perm_value is True or (isinstance(perm_value, str) and perm_value.lower() == "true"):
                             print(f"[check_permission] Permission GRANTED: {module_name}.{action} via role {role_id}")
+                            if isinstance(cache, dict):
+                                cache.setdefault("permission_checks", {})[perm_key] = True
                             return True
                         else:
                             print(f"[check_permission] Permission field {perm_field} is False or not set for {module_name}")
 
         print(f"[check_permission] Permission DENIED: {module_name}.{action} not found in any role")
+        if isinstance(cache, dict):
+            cache.setdefault("permission_checks", {})[perm_key] = False
         return False
     except Exception as e:
         print(f"[check_permission] Error checking permission: {e}")
         import traceback
         traceback.print_exc()
         return False
+    finally:
+        add_timing_ms("rbac", (time.perf_counter() - t0) * 1000.0)
 
 
 def get_all_roles(tenant_id: str) -> List[Dict[str, Any]]:

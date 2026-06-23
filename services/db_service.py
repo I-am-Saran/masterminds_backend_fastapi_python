@@ -4,11 +4,55 @@ Replaces Supabase client for local development
 """
 
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor
 from psycopg2.sql import Identifier, SQL, Composed
+from contextlib import contextmanager
 from typing import Optional, List, Dict, Any, Tuple
 from uuid import UUID
 from config import DB_URL
+from services.request_context import add_sql_call
+
+_pool: ThreadedConnectionPool | None = None
+
+
+def _pool_minconn() -> int:
+    import os
+
+    try:
+        return max(1, int(os.getenv("DB_POOL_MIN", "1")))
+    except Exception:
+        return 1
+
+
+def _pool_maxconn() -> int:
+    import os
+
+    try:
+        return max(_pool_minconn(), int(os.getenv("DB_POOL_MAX", "8")))
+    except Exception:
+        return max(_pool_minconn(), 8)
+
+
+def get_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = ThreadedConnectionPool(_pool_minconn(), _pool_maxconn(), dsn=DB_URL)
+    return _pool
+
+
+@contextmanager
+def pooled_connection():
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        yield conn
+    finally:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        pool.putconn(conn)
 
 
 def serialize_param(value: Any) -> Any:
@@ -16,12 +60,6 @@ def serialize_param(value: Any) -> Any:
     if isinstance(value, UUID):
         return str(value)
     return value
-
-
-def get_connection():
-    """Get a database connection."""
-    return psycopg2.connect(DB_URL)
-
 
 def table_exists(table_name: str) -> bool:
     """Return True if a public schema table exists."""
@@ -39,9 +77,14 @@ def table_exists(table_name: str) -> bool:
 
 def execute_query(query: str or SQL, params: tuple = None, fetch_one: bool = False, fetch_all: bool = True) -> Optional[Any]:
     """Execute a SQL query and return results."""
+    import time
+
     conn = None
+    pool = get_pool()
+    t0 = time.perf_counter()
+    close_conn = False
     try:
-        conn = get_connection()
+        conn = pool.getconn()
         cur = conn.cursor(cursor_factory=RealDictCursor)
         # Handle both string queries and psycopg2 SQL objects
         if isinstance(query, SQL):
@@ -79,6 +122,8 @@ def execute_query(query: str or SQL, params: tuple = None, fetch_one: bool = Fal
             conn.commit()
             return None
     except Exception as e:
+        if isinstance(e, psycopg2.OperationalError):
+            close_conn = True
         if conn:
             conn.rollback()
         # Print more details for debugging
@@ -90,8 +135,19 @@ def execute_query(query: str or SQL, params: tuple = None, fetch_one: bool = Fal
         print(f"Database error: {e}")
         raise
     finally:
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        add_sql_call(dt_ms)
+        try:
+            if "cur" in locals() and cur:
+                cur.close()
+        except Exception:
+            pass
         if conn:
-            conn.close()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            pool.putconn(conn, close=close_conn)
 
 
 def select_table(table_name: str, filters: Dict[str, Any] = None, order_by: str = None, limit: int = None) -> List[Dict[str, Any]]:
@@ -212,8 +268,9 @@ def delete_table(table_name: str, filters: Dict[str, Any]) -> Tuple[bool, int]:
     query = f"DELETE FROM {table_name} WHERE {where_clause}"
     params = tuple(serialize_param(v) for v in filters.values())
     conn = None
+    pool = get_pool()
     try:
-        conn = get_connection()
+        conn = pool.getconn()
         cur = conn.cursor()
         cur.execute(query, params)
         rowcount = cur.rowcount
@@ -225,8 +282,17 @@ def delete_table(table_name: str, filters: Dict[str, Any]) -> Tuple[bool, int]:
         print(f"Delete error: {e}")
         return (False, 0)
     finally:
+        try:
+            if "cur" in locals() and cur:
+                cur.close()
+        except Exception:
+            pass
         if conn:
-            conn.close()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            pool.putconn(conn)
 
 
 # Compatibility layer to mimic Supabase table API

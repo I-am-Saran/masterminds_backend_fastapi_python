@@ -8,8 +8,11 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple, cast
 import psycopg2
+import time
 from fastapi import HTTPException
-from config import DB_URL, JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
+from config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRATION_HOURS
+from services.db_service import pooled_connection
+from services.request_context import get_request_context, set_request_token, set_request_user, add_timing_ms
 
 
 def hash_password(password: str) -> str:
@@ -106,83 +109,89 @@ def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
+        with pooled_connection() as conn:
+            cur = conn.cursor()
 
-        # Query by normalized email; DB comparison case-insensitive via LOWER on both sides
-        cur.execute(
-            """
-            SELECT id, email, full_name, password, tenant_id, is_active, first_login, last_login
-            FROM users
-            WHERE LOWER(TRIM(email)) = LOWER(%s)
-            ORDER BY is_active DESC, updated_at DESC NULLS LAST
-            LIMIT 1
-            """,
-            (email,),
-        )
-        user_row = cur.fetchone()
+            try:
+                cur.execute(
+                    """
+                    SELECT id, email, full_name, password, tenant_id, is_active, first_login, last_login
+                    FROM users
+                    WHERE LOWER(TRIM(email)) = LOWER(%s)
+                    ORDER BY is_active DESC, updated_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (email,),
+                )
+                user_row = cur.fetchone()
 
-        logging.info(f"[auth] authenticate_user: normalized_email={email!r}, user_found={user_row is not None}")
+                logging.info(
+                    f"[auth] authenticate_user: normalized_email={email!r}, user_found={user_row is not None}"
+                )
 
-        if not user_row:
-            conn.close()
-            logging.warning(f"[auth] authenticate_user: user not found for email (normalized)")
-            return None
+                if not user_row:
+                    logging.warning("[auth] authenticate_user: user not found for email (normalized)")
+                    return None
 
-        user_id, user_email, full_name, hashed_password, tenant_id, is_active, first_login, last_login = user_row
+                user_id, user_email, full_name, hashed_password, tenant_id, is_active, first_login, last_login = (
+                    user_row
+                )
 
-        # Structured debug: hashed password length and type (do NOT log password or hash value)
-        hashed_len = len(hashed_password) if hashed_password else 0
-        hashed_type = type(hashed_password).__name__
-        logging.info(f"[auth] authenticate_user: hashed_password len={hashed_len}, type={hashed_type}")
+                hashed_len = len(hashed_password) if hashed_password else 0
+                hashed_type = type(hashed_password).__name__
+                logging.info(
+                    f"[auth] authenticate_user: hashed_password len={hashed_len}, type={hashed_type}"
+                )
 
-        if not is_active:
-            conn.close()
-            logging.warning("[auth] authenticate_user: user inactive")
-            return {"error": "inactive", "message": "Your account is inactive. Please contact your administrator."}
+                if not is_active:
+                    logging.warning("[auth] authenticate_user: user inactive")
+                    return {
+                        "error": "inactive",
+                        "message": "Your account is inactive. Please contact your administrator.",
+                    }
 
-        if not hashed_password or hashed_len < 60:
-            conn.close()
-            logging.warning("[auth] authenticate_user: no or invalid password set")
-            return {"error": "no_password", "message": "No password set for this account. Please use SSO login or contact your administrator."}
+                if not hashed_password or hashed_len < 60:
+                    logging.warning("[auth] authenticate_user: no or invalid password set")
+                    return {
+                        "error": "no_password",
+                        "message": "No password set for this account. Please use SSO login or contact your administrator.",
+                    }
 
-        # Verify password: plain password vs stored hash only (no hashing of input)
-        pw_ok = verify_password(password, hashed_password)
-        logging.info(f"[auth] authenticate_user: bcrypt comparison result={pw_ok}")
+                pw_ok = verify_password(password, hashed_password)
+                logging.info(f"[auth] authenticate_user: bcrypt comparison result={pw_ok}")
 
-        if not pw_ok:
-            conn.close()
-            logging.warning("[auth] authenticate_user: password verification failed")
-            return None
+                if not pw_ok:
+                    logging.warning("[auth] authenticate_user: password verification failed")
+                    return None
 
-        # Require password change only when password is still the default "pass"
-        is_default_password = verify_password("pass", hashed_password)
-        is_first_time = is_default_password
+                is_default_password = verify_password("pass", hashed_password)
+                is_first_time = is_default_password
 
-        if first_login is None:
-            cur.execute(
-                "UPDATE users SET first_login = NOW(), last_login = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE id = %s",
-                (user_id,)
-            )
-        else:
-            cur.execute(
-                "UPDATE users SET last_login = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE id = %s",
-                (user_id,)
-            )
-        conn.commit()
-        conn.close()
+                if first_login is None:
+                    cur.execute(
+                        "UPDATE users SET first_login = NOW(), last_login = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE id = %s",
+                        (user_id,),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE users SET last_login = NOW(), login_count = COALESCE(login_count, 0) + 1 WHERE id = %s",
+                        (user_id,),
+                    )
+                conn.commit()
 
-        token = create_jwt_token(user_id, user_email)
-        logging.info(f"[auth] authenticate_user: login successful, user_id={user_id}")
+                token = create_jwt_token(user_id, user_email)
+                logging.info(f"[auth] authenticate_user: login successful, user_id={user_id}")
 
-        return {
-            "user_id": user_id,
-            "email": user_email,
-            "full_name": full_name,
-            "tenant_id": tenant_id,
-            "token": token,
-            "requires_password_change": is_first_time,
-        }
+                return {
+                    "user_id": user_id,
+                    "email": user_email,
+                    "full_name": full_name,
+                    "tenant_id": tenant_id,
+                    "token": token,
+                    "requires_password_change": is_first_time,
+                }
+            finally:
+                cur.close()
     except psycopg2.Error as e:
         logging.exception(f"[auth] authenticate_user: database error: {e}")
         return None
@@ -193,6 +202,13 @@ def authenticate_user(email: str, password: str) -> Optional[Dict[str, Any]]:
 
 def get_user_from_token(token: str) -> Optional[Dict[str, Any]]:
     """Get user information from JWT token."""
+    t0 = time.perf_counter()
+    ctx = get_request_context()
+    if ctx and ctx.get("token") == token and ctx.get("user") is not None:
+        user = cast(Optional[Dict[str, Any]], ctx.get("user"))
+        add_timing_ms("auth", (time.perf_counter() - t0) * 1000.0)
+        return user
+
     payload = verify_jwt_token(token)
     if not payload:
         return None
@@ -202,61 +218,46 @@ def get_user_from_token(token: str) -> Optional[Dict[str, Any]]:
         return None
     
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        
-        cur.execute(
-            "SELECT id, email, full_name, tenant_id FROM users WHERE id = %s AND is_active = TRUE",
-            (user_id,)
-        )
-        user_row = cur.fetchone()
-        conn.close()
-        
+        with pooled_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT id, email, full_name, tenant_id FROM users WHERE id = %s AND is_active = TRUE",
+                    (user_id,),
+                )
+                user_row = cur.fetchone()
+            finally:
+                cur.close()
+
         if not user_row:
             return None
-        
+
         user_id, email, full_name, tenant_id = user_row
-        
-        return {
+        user = {
             "user_id": user_id,
             "id": user_id,
             "email": email,
             "full_name": full_name,
             "tenant_id": tenant_id,
         }
-    except psycopg2.OperationalError as e:
-        print(f"Database connection error in get_user_from_token, retrying once: {e}")
-        try:
-            conn = psycopg2.connect(DB_URL)
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, email, full_name, tenant_id FROM users WHERE id = %s AND is_active = TRUE",
-                (user_id,)
-            )
-            user_row = cur.fetchone()
-            conn.close()
-            if not user_row:
-                return None
-            user_id, email, full_name, tenant_id = user_row
-            return {
-                "user_id": user_id,
-                "id": user_id,
-                "email": email,
-                "full_name": full_name,
-                "tenant_id": tenant_id,
-            }
-        except Exception as retry_e:
-            print(f"Retry failed getting user from token: {retry_e}")
-            return None
-    except Exception as e:
-        print(f"Error getting user from token: {e}")
+        if ctx is not None:
+            set_request_token(token)
+            set_request_user(user)
+        return user
+    except Exception:
         return None
+    finally:
+        add_timing_ms("auth", (time.perf_counter() - t0) * 1000.0)
 
 def auth_guard(authorization: Optional[str]) -> Dict[str, Any]:
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
     token = authorization.split(" ", 1)[1].strip()
-    user = get_user_from_token(token)
+    ctx = get_request_context()
+    if ctx and ctx.get("token") == token and ctx.get("user") is not None:
+        user = cast(Dict[str, Any], ctx.get("user"))
+    else:
+        user = get_user_from_token(token)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user = cast(Dict[str, Any], user)

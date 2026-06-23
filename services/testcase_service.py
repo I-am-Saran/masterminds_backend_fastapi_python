@@ -1,6 +1,6 @@
 
 from typing import List, Dict, Any, Optional
-from services.db_service import execute_query, insert_table, update_table, get_connection as get_db_connection
+from services.db_service import execute_query, insert_table, update_table, pooled_connection
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import Json
@@ -96,33 +96,24 @@ class TestcaseService:
 
     @staticmethod
     def create_bulk_testcases(rows: List[Dict[str, Any]], tenant_id: str):
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            for row in rows:
-                # Ensure tenant_id is added
-                row['tenant_id'] = tenant_id
-                
-                # Using insert_table logic manually to support bulk inside transaction
-                # But insert_table commits by default? No, db_service.insert_table creates its own connection/cursor usually.
-                # I should write raw SQL for transaction safety here.
-                
-                columns = list(row.keys())
-                values = [row[col] for col in columns]
-                placeholders = ",".join(["%s"] * len(values))
-                col_str = ",".join(columns)
-                
-                query = f"INSERT INTO testcases ({col_str}) VALUES ({placeholders})"
-                cur.execute(query, tuple(values))
-            
-            conn.commit()
-            return True
-        except Exception as e:
-            conn.rollback()
-            raise e
-        finally:
-            cur.close()
-            conn.close()
+        with pooled_connection() as conn:
+            cur = conn.cursor()
+            try:
+                for row in rows:
+                    row["tenant_id"] = tenant_id
+                    columns = list(row.keys())
+                    values = [row[col] for col in columns]
+                    placeholders = ",".join(["%s"] * len(values))
+                    col_str = ",".join(columns)
+                    query = f"INSERT INTO testcases ({col_str}) VALUES ({placeholders})"
+                    cur.execute(query, tuple(values))
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                return False
+            finally:
+                cur.close()
 
     @staticmethod
     def update_testcase(testcase_id: str, updates: Dict[str, Any], user: Dict[str, Any]):

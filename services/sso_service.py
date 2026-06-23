@@ -7,10 +7,10 @@ existing Master Minds users only. No auto-provisioning.
 from typing import Any, Dict, Optional
 
 import jwt
-import psycopg2
 from jwt import PyJWKClient
 
-from config import DB_URL, MS_TENANT_ID, MS_CLIENT_ID
+from config import MS_TENANT_ID, MS_CLIENT_ID
+from services.db_service import pooled_connection
 
 ALLOWED_EMAIL_DOMAINS = ["@cavininfotech.com", "@hepl.com"]
 DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
@@ -38,58 +38,54 @@ def get_sso_user(
     sso_user_id: str,
 ) -> Optional[Dict[str, Any]]:
     """Look up an existing Master Minds user. Never auto-creates accounts."""
-    conn = None
     try:
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
+        with pooled_connection() as conn:
+            cur = conn.cursor()
 
-        cur.execute(
-            "SELECT id, email, full_name, tenant_id, is_active FROM users WHERE LOWER(email) = LOWER(%s) LIMIT 1",
-            (email,),
-        )
-        user_row = cur.fetchone()
+            cur.execute(
+                "SELECT id, email, full_name, tenant_id, is_active FROM users WHERE LOWER(email) = LOWER(%s) LIMIT 1",
+                (email,),
+            )
+            user_row = cur.fetchone()
 
-        if not user_row:
-            conn.close()
+            if not user_row:
+                cur.close()
+                return {
+                    "error": "user_not_found",
+                    "message": (
+                        "Your account is not registered in Master Minds. "
+                        "Please use Request Access or contact your administrator."
+                    ),
+                }
+
+            user_id, user_email, user_full_name, user_tenant_id, is_active = user_row
+
+            if not is_active:
+                cur.close()
+                return {
+                    "error": "inactive",
+                    "message": "Your account is inactive. Please contact your administrator.",
+                }
+
+            cur.execute(
+                """UPDATE users
+                   SET sso_provider = %s, sso_user_id = %s, last_login = NOW(),
+                       login_count = COALESCE(login_count, 0) + 1,
+                       updated_at = NOW()
+                   WHERE id = %s""",
+                ("microsoft", sso_user_id, user_id),
+            )
+            conn.commit()
+            cur.close()
+
             return {
-                "error": "user_not_found",
-                "message": (
-                    "Your account is not registered in Master Minds. "
-                    "Please use Request Access or contact your administrator."
-                ),
+                "user_id": str(user_id),
+                "email": user_email,
+                "full_name": user_full_name or full_name,
+                "tenant_id": str(user_tenant_id) if user_tenant_id else DEFAULT_TENANT_ID,
             }
-
-        user_id, user_email, user_full_name, user_tenant_id, is_active = user_row
-
-        if not is_active:
-            conn.close()
-            return {
-                "error": "inactive",
-                "message": "Your account is inactive. Please contact your administrator.",
-            }
-
-        cur.execute(
-            """UPDATE users
-               SET sso_provider = %s, sso_user_id = %s, last_login = NOW(),
-                   login_count = COALESCE(login_count, 0) + 1,
-                   updated_at = NOW()
-               WHERE id = %s""",
-            ("microsoft", sso_user_id, user_id),
-        )
-        conn.commit()
-        conn.close()
-
-        return {
-            "user_id": str(user_id),
-            "email": user_email,
-            "full_name": user_full_name or full_name,
-            "tenant_id": str(user_tenant_id) if user_tenant_id else DEFAULT_TENANT_ID,
-        }
     except Exception as e:
         print(f"Error in get_sso_user: {e}")
-        if conn:
-            conn.rollback()
-            conn.close()
         return None
 
 

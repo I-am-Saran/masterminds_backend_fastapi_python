@@ -10,7 +10,7 @@ from typing import Optional, List, Dict, Any
 # from services.supabase_client import supabase
 from services.auth_service import auth_guard
 from services.db_service import local_db as supabase  # Use local DB service
-from services.db_service import execute_query
+from services.db_service import execute_query, pooled_connection
 from services.formatters import normalize_control, normalize_control_list, normalize_action
 from services.auth_service import authenticate_user, verify_jwt_token, get_user_from_token, verify_password, validate_password_strength
 from services.rbac_service import (
@@ -69,6 +69,7 @@ from email.message import EmailMessage
 from datetime import datetime, timezone
 import time
 import uuid
+from services.request_context import init_request_context, get_request_context, set_request_token, set_request_user
 
 
 
@@ -116,6 +117,37 @@ async def fix_double_api_path(request: Request, call_next):
     new_scope = {**request.scope, "path": new_path}
     new_request = Request(new_scope)
     return await call_next(new_request)
+
+@app.middleware("http")
+async def request_context_middleware(request: Request, call_next):
+    t0 = time.perf_counter()
+    init_request_context()
+    authorization = request.headers.get("authorization")
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    set_request_token(token)
+
+    user = None
+    if token:
+        user = get_user_from_token(token)
+    set_request_user(user)
+    request.state.user = user
+
+    response = await call_next(request)
+
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    ctx = get_request_context()
+    timings = (ctx or {}).get("timings_ms") or {}
+    timings["total"] = total_ms
+    sql_calls = (ctx or {}).get("sql_calls", 0)
+    logging.info(
+        f"[perf] {request.method} {request.url.path} total_ms={total_ms:.1f} "
+        f"auth_ms={float(timings.get('auth', 0.0)):.1f} "
+        f"rbac_ms={float(timings.get('rbac', 0.0)):.1f} "
+        f"sql_ms={float(timings.get('sql', 0.0)):.1f} sql_calls={sql_calls}"
+    )
+    return response
 
 @app.on_event("startup")
 async def on_startup():
@@ -960,40 +992,33 @@ async def change_password(
             raise HTTPException(status_code=400, detail=error_msg)
         
         # Verify current password and update to new password
-        import psycopg2
-        from config import DB_URL
-        
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        
-        # Get current password hash
-        cur.execute("SELECT password FROM users WHERE id = %s", (user_id,))
-        row = cur.fetchone()
-        
-        if not row:
-            conn.close()
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        current_hashed_password = row[0]
-        
-        # Verify current password
-        if not verify_password(payload.current_password, current_hashed_password):
-            conn.close()
-            raise HTTPException(status_code=400, detail="Current password is incorrect")
-        
-        # Check if new password is same as current password
-        if verify_password(payload.new_password, current_hashed_password):
-            conn.close()
-            raise HTTPException(status_code=400, detail="New password must be different from current password")
-        
-        # Update password
-        new_hashed_password = hash_password(payload.new_password)
-        cur.execute(
-            "UPDATE users SET password = %s, updated_at = NOW() WHERE id = %s",
-            (new_hashed_password, user_id)
-        )
-        conn.commit()
-        conn.close()
+        with pooled_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT password FROM users WHERE id = %s", (user_id,))
+                row = cur.fetchone()
+
+                if not row:
+                    raise HTTPException(status_code=404, detail="User not found")
+
+                current_hashed_password = row[0]
+
+                if not verify_password(payload.current_password, current_hashed_password):
+                    raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+                if verify_password(payload.new_password, current_hashed_password):
+                    raise HTTPException(
+                        status_code=400, detail="New password must be different from current password"
+                    )
+
+                new_hashed_password = hash_password(payload.new_password)
+                cur.execute(
+                    "UPDATE users SET password = %s, updated_at = NOW() WHERE id = %s",
+                    (new_hashed_password, user_id),
+                )
+                conn.commit()
+            finally:
+                cur.close()
         
         return {
             "data": {
@@ -1031,22 +1056,20 @@ async def check_password_change(
         user_id = user_info["user_id"]
         
         # Check if password is default or first login
-        import psycopg2
-        from config import DB_URL
-        
-        conn = psycopg2.connect(DB_URL)
-        cur = conn.cursor()
-        
-        cur.execute(
-            "SELECT password, first_login, last_login FROM users WHERE id = %s",
-            (user_id,)
-        )
-        row = cur.fetchone()
-        conn.close()
-        
+        with pooled_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT password, first_login, last_login FROM users WHERE id = %s",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+            finally:
+                cur.close()
+
         if not row:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         hashed_password, first_login, last_login = row
         
         # Require password change only when password is still the default "pass"
