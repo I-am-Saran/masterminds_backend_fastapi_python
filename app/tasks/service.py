@@ -19,8 +19,15 @@ from app.tasks.validators import (
 )
 
 
-def _actor_uuid(auth: Dict[str, Any]) -> Optional[str]:
-    return repo.resolve_owner_uuid(auth.get("email"))
+def _actor_uuid(
+    auth: Dict[str, Any], resolved_user_ids: Optional[Dict[str, Optional[str]]] = None
+) -> Optional[str]:
+    email = _actor_email(auth).lower()
+    if not email:
+        return None
+    if resolved_user_ids is not None:
+        return resolved_user_ids.get(email)
+    return repo.resolve_owner_uuid(email)
 
 
 def _actor_email(auth: Dict[str, Any]) -> str:
@@ -62,6 +69,7 @@ class TaskService:
     def create_task(payload: TaskCreate, auth: Dict[str, Any]) -> Dict[str, Any]:
         tenant_id = str(auth["tenant_id"])
         meeting_id = payload.meeting_id
+        actor_email = _actor_email(auth).lower()
         source_type = validate_source_type(
             payload.source_type.value if hasattr(payload.source_type, "value") else payload.source_type,
             meeting_id,
@@ -77,13 +85,22 @@ class TaskService:
         )
         category = validate_category(payload.category, required=True)
         owner_email = normalize_email(payload.owner_email) if payload.owner_email else None
+        watcher_emails = []
+        for raw_email in payload.watcher_emails or []:
+            normalized_email = normalize_email(raw_email)
+            if normalized_email:
+                watcher_emails.append(normalized_email)
+        resolved_user_ids = repo.resolve_owner_uuids(
+            [email for email in [actor_email, owner_email, *watcher_emails] if email]
+        )
+        actor_uuid = resolved_user_ids.get(actor_email) if actor_email else None
 
         data = {
             "tenant_id": tenant_id,
             "title": payload.title.strip(),
             "description": payload.description,
             "owner_email": owner_email,
-            "owner_id": repo.resolve_owner_uuid(owner_email) if owner_email else None,
+            "owner_id": resolved_user_ids.get(owner_email) if owner_email else None,
             "status": status,
             "priority": priority,
             "due_date": payload.due_date,
@@ -92,7 +109,7 @@ class TaskService:
             "source_type": source_type,
             "is_blocked": payload.is_blocked or status == "BLOCKED",
             "blocked_reason": payload.blocked_reason,
-            "created_by": _actor_uuid(auth),
+            "created_by": actor_uuid,
         }
         if status == "DONE":
             data["completed_at"] = datetime.now(timezone.utc)
@@ -102,18 +119,17 @@ class TaskService:
             raise HTTPException(status_code=500, detail="Failed to create task")
 
         task_id = created["id"]
-        if payload.watcher_emails:
-            repo.replace_watchers(task_id, payload.watcher_emails)
+        if watcher_emails:
+            repo.replace_watchers(task_id, watcher_emails, resolved_user_ids=resolved_user_ids)
 
         repo.insert_history(
             task_id, "status", None, status,
             changed_by_email=auth.get("email"),
-            changed_by_id=_actor_uuid(auth),
+            changed_by_id=actor_uuid,
         )
 
         if payload.sync_mom_action and meeting_id:
             meeting_sync.create_mom_action_for_task(created)
-            created = repo.get_by_id(task_id, tenant_id) or created
 
         from app.workflows.engine import start_workflow_for_task
 
@@ -123,6 +139,8 @@ class TaskService:
                 category,
                 tenant_id,
                 auth.get("user_id"),
+                resolved_user_ids=resolved_user_ids,
+                check_existing=False,
             )
         except Exception:
             logging.exception("Workflow auto-start failed for task %s", task_id)

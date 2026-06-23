@@ -69,17 +69,58 @@ def _not_deleted() -> str:
     return "t.is_deleted = FALSE"
 
 
-def resolve_owner_uuid(email: Optional[str]) -> Optional[str]:
+def _normalize_email(email: Optional[str]) -> Optional[str]:
     if not email:
         return None
-    row = execute_query(
-        "SELECT uuid_id FROM users WHERE LOWER(email) = LOWER(%s) LIMIT 1",
-        (email.strip(),),
-        fetch_one=True,
-    )
-    if row and row.get("uuid_id"):
-        return str(row["uuid_id"])
-    return None
+    normalized = email.strip().lower()
+    return normalized or None
+
+
+def resolve_owner_uuids(emails: List[str]) -> Dict[str, Optional[str]]:
+    normalized_emails = []
+    seen = set()
+    for email in emails:
+        normalized = _normalize_email(email)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            normalized_emails.append(normalized)
+
+    if not normalized_emails:
+        return {}
+
+    placeholders = ", ".join(["%s"] * len(normalized_emails))
+    rows = execute_query(
+        f"""
+        SELECT LOWER(email) AS email_key, uuid_id
+        FROM users
+        WHERE LOWER(email) IN ({placeholders})
+        """,
+        tuple(normalized_emails),
+        fetch_all=True,
+    ) or []
+
+    resolved = {email: None for email in normalized_emails}
+    for row in rows:
+        email_key = row.get("email_key")
+        if email_key:
+            resolved[str(email_key)] = str(row["uuid_id"]) if row.get("uuid_id") else None
+    return resolved
+
+
+def resolve_owner_uuid(email: Optional[str]) -> Optional[str]:
+    normalized = _normalize_email(email)
+    if not normalized:
+        return None
+    return resolve_owner_uuids([normalized]).get(normalized)
+
+
+def _load_watchers(task_id: str) -> List[str]:
+    watchers = execute_query(
+        f"SELECT user_email FROM {TABLE_WATCHERS} WHERE task_id = %s ORDER BY user_email",
+        (task_id,),
+        fetch_all=True,
+    ) or []
+    return [w["user_email"] for w in watchers]
 
 
 def list_tasks(
@@ -178,7 +219,9 @@ def list_tasks(
     return [_serialize(r) for r in rows], total
 
 
-def get_by_legacy_mom_action_id(legacy_id: int, tenant_id: str) -> Optional[Dict[str, Any]]:
+def get_by_legacy_mom_action_id(
+    legacy_id: int, tenant_id: str, *, include_watchers: bool = True
+) -> Optional[Dict[str, Any]]:
     row = execute_query(
         f"""
         {_base_select()}
@@ -191,16 +234,12 @@ def get_by_legacy_mom_action_id(legacy_id: int, tenant_id: str) -> Optional[Dict
     if not row:
         return None
     data = _serialize(row)
-    watchers = execute_query(
-        f"SELECT user_email FROM {TABLE_WATCHERS} WHERE task_id = %s ORDER BY user_email",
-        (str(data["id"]),),
-        fetch_all=True,
-    ) or []
-    data["watchers"] = [w["user_email"] for w in watchers]
+    if include_watchers and data:
+        data["watchers"] = _load_watchers(str(data["id"]))
     return data
 
 
-def get_by_id(task_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
+def get_by_id(task_id: str, tenant_id: str, *, include_watchers: bool = True) -> Optional[Dict[str, Any]]:
     row = execute_query(
         f"""
         {_base_select()}
@@ -213,12 +252,8 @@ def get_by_id(task_id: str, tenant_id: str) -> Optional[Dict[str, Any]]:
     if not row:
         return None
     data = _serialize(row)
-    watchers = execute_query(
-        f"SELECT user_email FROM {TABLE_WATCHERS} WHERE task_id = %s ORDER BY user_email",
-        (task_id,),
-        fetch_all=True,
-    ) or []
-    data["watchers"] = [w["user_email"] for w in watchers]
+    if include_watchers and data:
+        data["watchers"] = _load_watchers(task_id)
     return data
 
 
@@ -232,17 +267,28 @@ def insert_task(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     created = insert_table(TABLE_TASKS, payload)
     if not created:
         return None
-    return get_by_id(str(created["id"]), str(created["tenant_id"]))
+    return _serialize(created)
 
 
-def update_task(task_id: str, tenant_id: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def update_task(
+    task_id: str,
+    tenant_id: str,
+    data: Dict[str, Any],
+    *,
+    refresh: bool = True,
+    include_watchers: bool = True,
+) -> Optional[Dict[str, Any]]:
     payload = {k: v for k, v in data.items() if k in KAIZEN_TASK_COLUMNS and k not in ("id", "tenant_id")}
     payload["updated_at"] = datetime.now(timezone.utc)
     payload["last_activity_at"] = payload["updated_at"]
     if not payload:
-        return get_by_id(task_id, tenant_id)
+        return get_by_id(task_id, tenant_id, include_watchers=include_watchers)
     updated = update_table(TABLE_TASKS, payload, filters={"id": task_id, "tenant_id": tenant_id})
-    return get_by_id(task_id, tenant_id) if updated else None
+    if not updated:
+        return None
+    if not refresh:
+        return _serialize(updated)
+    return get_by_id(task_id, tenant_id, include_watchers=include_watchers)
 
 
 def soft_delete(task_id: str, tenant_id: str) -> bool:
@@ -340,14 +386,30 @@ def insert_comment(
     return _serialize(row)
 
 
-def replace_watchers(task_id: str, emails: List[str]) -> None:
+def replace_watchers(
+    task_id: str,
+    emails: List[str],
+    *,
+    resolved_user_ids: Optional[Dict[str, Optional[str]]] = None,
+) -> None:
     execute_query(f"DELETE FROM {TABLE_WATCHERS} WHERE task_id = %s", (task_id,), fetch_all=False)
+    normalized_watchers = []
+    seen = set()
     for raw in emails:
-        em = (raw or "").strip().lower()
-        if em:
+        em = _normalize_email(raw)
+        if em and em not in seen:
+            seen.add(em)
+            normalized_watchers.append(em)
+
+    watcher_ids = dict(resolved_user_ids or {})
+    missing = [email for email in normalized_watchers if email not in watcher_ids]
+    if missing:
+        watcher_ids.update(resolve_owner_uuids(missing))
+
+    for em in normalized_watchers:
             insert_table(
                 TABLE_WATCHERS,
-                {"task_id": task_id, "user_email": em, "user_id": resolve_owner_uuid(em)},
+                {"task_id": task_id, "user_email": em, "user_id": watcher_ids.get(em)},
             )
 
 

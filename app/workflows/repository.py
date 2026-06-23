@@ -282,10 +282,10 @@ def update_instance(instance_id: str, data: Dict[str, Any]) -> Optional[Dict[str
     return update_table("workflow_ticket_instances", data, {"id": instance_id})
 
 
-def insert_history(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def insert_history(data: Dict[str, Any], *, normalize_performed_by: bool = True) -> Optional[Dict[str, Any]]:
     payload = dict(data)
     # performed_by FK references users.id (TEXT), not users.uuid_id
-    if payload.get("performed_by") is not None:
+    if normalize_performed_by and payload.get("performed_by") is not None:
         pb = str(payload["performed_by"])
         row = execute_query(
             "SELECT id FROM users WHERE id = %s OR uuid_id::text = %s LIMIT 1",

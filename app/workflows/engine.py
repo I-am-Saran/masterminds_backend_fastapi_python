@@ -20,13 +20,16 @@ def start_workflow_for_task(
     category: Optional[str],
     tenant_id: str,
     performer_id: Optional[str],
+    resolved_user_ids: Optional[Dict[str, Optional[str]]] = None,
+    check_existing: bool = True,
 ) -> Optional[Dict[str, Any]]:
     if not category or not str(category).strip():
         return None
 
-    existing = repo.get_instance_by_ticket(ticket_id)
-    if existing:
-        return existing
+    if check_existing:
+        existing = repo.get_instance_by_ticket(ticket_id)
+        if existing:
+            return existing
 
     workflow = repo.get_active_workflow_by_category(tenant_id, str(category))
     if not workflow:
@@ -54,7 +57,8 @@ def start_workflow_for_task(
             "action_taken": "STARTED",
             "comments": f"Workflow '{workflow.get('workflow_name')}' started at {first_level.get('level_name')}",
             "performed_by": performer_id,
-        }
+        },
+        normalize_performed_by=False,
     )
 
     owner_email = repo.resolve_owner_email(
@@ -64,10 +68,20 @@ def start_workflow_for_task(
     )
     # Assign workflow owner but keep ticket status OPEN until assignee clicks Start Work.
     if owner_email:
+        normalized_owner_email = owner_email.strip().lower()
+        owner_uuid = None
+        if resolved_user_ids is not None:
+            owner_uuid = resolved_user_ids.get(normalized_owner_email)
+            if normalized_owner_email not in resolved_user_ids:
+                resolved_user_ids.update(task_repo.resolve_owner_uuids([normalized_owner_email]))
+                owner_uuid = resolved_user_ids.get(normalized_owner_email)
+        else:
+            owner_uuid = task_repo.resolve_owner_uuid(normalized_owner_email)
         task_repo.update_task(
             ticket_id,
             tenant_id,
-            {"owner_email": owner_email, "owner_id": task_repo.resolve_owner_uuid(owner_email)},
+            {"owner_email": normalized_owner_email, "owner_id": owner_uuid},
+            refresh=False,
         )
 
     return instance
