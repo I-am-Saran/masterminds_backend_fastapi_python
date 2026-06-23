@@ -1,0 +1,1 @@
+"""Kaizen app package."""

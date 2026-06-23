@@ -1,0 +1,123 @@
+{
+  "Status": [
+    "Open",
+    "Dev In Progress",
+    "Resolved",
+    "QA Passed",
+    "Closed",
+    "QA Reopened",
+    "Ready for QA",
+    "QA In Progress",
+    "Deferred",
+    "Descoped",
+    "Invalid",
+    "Ready for UAT",
+    "Reject",
+    "UAT Passed",
+    "UAT Reopened",
+    "Ready for Production"
+  ],
+  "Priority": [
+    "Low",
+    "Medium",
+    "High",
+    "Blocker"
+  ],
+  "Severity": [
+    "Trivial",
+    "Minor",
+    "Major",
+    "Critical",
+    "Blocker"
+  ],
+  "Defect type": [
+    "Functional",
+    "UI",
+    "Performance",
+    "Security",
+    "Compatibility"
+  ],
+  "Resolution": [
+    "Unresolved",
+    "Fixed",
+    "Won't Fix",
+    "Duplicate",
+    "Invalid",
+    "Works as Designed"
+  ],
+  "Automation Intent": [
+    "Yes",
+    "No"
+  ],
+  "automation status": [
+    "Pending",
+    "Automated",
+    "Skipped",
+    "In Progress"
+  ],
+  "Device type": [
+    "Web",
+    "Mobile",
+    "Tablet",
+    "Desktop"
+  ],
+  "Browser tested": [
+    "Chrome",
+    "Firefox",
+    "Edge",
+    "Safari",
+    "Opera",
+    "Internet Explorer"
+  ],
+  "OS": [
+    "Windows",
+    "MacOS",
+    "Linux",
+    "Android",
+    "iOS",
+    "Other"
+  ],
+  "Hardware": [
+    "PC",
+    "Mobile",
+    "Tablet",
+    "Other"
+  ],
+  "Testing phase": [
+    "System testing",
+    "Regression",
+    "UAT",
+    "Smoke",
+    "Integration",
+    "Unit"
+  ],
+  "Ticket Type": [
+    "Bug",
+    "Change Request",
+    "New Feature",
+    "Suggestions",
+    "Enhancement"
+  ],
+  "Classification": [
+    "P1",
+    "P2",
+    "P3",
+    "P4"
+  ],
+  "Internally Reviewed?": [
+    "Yes",
+    "No"
+  ],
+  "Reviewed in Triage?": [
+    "Yes",
+    "No"
+  ],
+  "Root cause category": [
+    "Code Issue",
+    "Design Issue",
+    "Configuration Issue",
+    "Environment Issue",
+    "Data Issue",
+    "Unknown"
+  ]
+}

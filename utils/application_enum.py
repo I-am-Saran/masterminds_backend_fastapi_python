@@ -1,0 +1,50 @@
+from enum import Enum
+from typing import List
+
+
+class ApplicationName(str, Enum):
+    ALTEC_DIST_WEB = "Altec Dist. Web"
+    ALTEC_SM_MOBILE = "Altec SM Mobile"
+    SALES_CODE_AI = "SalesCode.ai"
+    BUDGIE_2_4_MOBILE = "Budgie 2.4 Mobile"
+    MYCDATA = "MYCData"
+    BUDGIE_3_0_MOBILE = "Budgie 3.0 Mobile"
+    BUDGIE_3_0_WEB = "Budgie 3.0 Web"
+    INFLUENCER_ONBOARDING = "Influencer Onboarding"
+    CLM = "CLM"
+    ROUTEPRO_MOBILE = "RoutePro Mobile"
+    GOAL_SYNC_WEB = "Goal Sync Web"
+    ENTERPRISE_RETAILER_BOT_S_AND_D = "Enterprise Retailer BOT - S and D"
+    TROVE_MOBILE = "Trove Mobile"
+    TROVE_WEB = "Trove Web"
+    LMS_WEB = "LMS Web"
+    BUDGIE_CEM_MOBILE = "Budgie CEM Mobile"
+    SURVEY_WEB = "Survey Web"
+    SURVEY_MOB = "Survey Mob"
+    CONVEX_WF = "Convex WF"
+    CONVEX_AGILE = "Convex AGILE"
+    ASCENDIO_MOBILE = "Ascendio Mobile"
+    ASCENDIO_WEB = "Ascendio Web"
+    ASSET_MANAGEMENT_CKPL = "Asset management CKPL"
+    CK_L_AND_D_PHASE_II = "CK L&D Phase II"
+    CAVINS_PRO = "Cavins Pro"
+    CK_TICKETING_TOOL = "CK Ticketing tool"
+    STOCK_AUDIT = "Stock Audit"
+    DIGITAL_AGREEMENTS = "Digital Agreements"
+    FORM_BUILDER = "Form builder"
+    MATERIAL_RECEIPT = "Material receipt"
+    MILK_TRACKING = "Milk Tracking"
+    MOON_BAKES = "Moon Bakes"
+    PMO = "PMO"
+    INTERNAL_AUDIT_AUTOMATION = "Internal Audit Automation"
+    AUDIT_360 = "Audit 360"
+    RAMCO = "RAMCO"
+    SOP = "SOP"
+    SOP_EASE = "SOP Ease"
+    TPU_AUTOMATION = "TPU Automation"
+    ROUTEPRO_MARRIAGE_HALL = "RoutePro Marriage Hall"
+    KAIZEN="Kaizen"
+
+    @classmethod
+    def dropdown(cls) -> List[str]:
+        return [item.value for item in cls]
