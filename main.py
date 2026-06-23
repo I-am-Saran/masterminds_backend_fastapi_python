@@ -88,19 +88,10 @@ logging.info(f"Starting Kaizen Backend {APP_VERSION}")
 
 # Allow your frontend origin
 # In development, allow all origins. In production, specify exact origins.
-_allowed_origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:4173",
-    "http://127.0.0.1:4173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-    "http://localhost:4174",
-    "http://127.0.0.1:4174",
-]
+_allowed_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
